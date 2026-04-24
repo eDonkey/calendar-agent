@@ -8,18 +8,15 @@ Uso:
     python get_token.py
 """
 import json
-import os
 from google_auth_oauthlib.flow import InstalledAppFlow
-
-dotenv_path = os.path.join(os.path.dirname(__file__), ".env")
 
 SCOPES = ["https://www.googleapis.com/auth/calendar"]
 
 # Pegá aquí tus credenciales de Google Cloud Console
 CLIENT_CONFIG = {
     "installed": {
-        "client_id":  os.getenv("GOOGLE_CLIENT_ID"),
-        "client_secret": os.getenv("GOOGLE_CLIENT_SECRET"),
+        "client_id": "TU_CLIENT_ID.apps.googleusercontent.com",
+        "client_secret": "TU_CLIENT_SECRET",
         "auth_uri": "https://accounts.google.com/o/oauth2/auth",
         "token_uri": "https://oauth2.googleapis.com/token",
         "redirect_uris": ["urn:ietf:wg:oauth:2.0:oob", "http://localhost"],

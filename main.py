@@ -1,10 +1,8 @@
 import os
-import hmac
-import hashlib
 import logging
 import httpx
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, Request, Header, HTTPException, BackgroundTasks
+from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -86,17 +84,6 @@ async def health():
 
 # ── Kapso / WhatsApp Webhook ─────────────────────────────────────────────────
 
-def verify_kapso_signature(raw_body: bytes, signature_header: str) -> bool:
-    """Verifica la firma HMAC-SHA256 que Kapso envía en cada webhook."""
-    secret = os.getenv("KAPSO_WEBHOOK_SECRET", "")
-    if not secret:
-        return True  # sin secret configurado, se acepta todo (solo para dev)
-    expected = "sha256=" + hmac.new(
-        secret.encode(), raw_body, hashlib.sha256
-    ).hexdigest()
-    return hmac.compare_digest(expected, signature_header or "")
-
-
 async def send_whatsapp_reply(phone_number_id: str, to: str, text: str):
     """Envía una respuesta de texto por WhatsApp vía Kapso API."""
     kapso_key = os.getenv("KAPSO_API_KEY")
@@ -108,12 +95,9 @@ async def send_whatsapp_reply(phone_number_id: str, to: str, text: str):
     payload = {
         "to": to,
         "type": "text",
-        "text": {"body": text[:4000]},  # WhatsApp tiene límite de 4096 chars
+        "text": {"body": text[:4000]},
     }
-    headers = {
-        "X-API-Key": kapso_key,
-        "Content-Type": "application/json",
-    }
+    headers = {"X-API-Key": kapso_key, "Content-Type": "application/json"}
     async with httpx.AsyncClient(timeout=30) as client:
         resp = await client.post(url, json=payload, headers=headers)
         if resp.status_code not in (200, 201):
@@ -123,73 +107,65 @@ async def send_whatsapp_reply(phone_number_id: str, to: str, text: str):
 
 
 async def process_whatsapp_message(phone_number_id: str, from_number: str, text: str):
-    """Corre el agente y responde por WhatsApp. Se ejecuta en background."""
+    """Corre el agente y responde por WhatsApp en background."""
     try:
-        logger.info(f"Mensaje de {from_number}: {text[:80]}")
+        logger.info(f"Procesando mensaje de {from_number}: {text[:80]}")
         result = await run_calendar_agent(text)
         await send_whatsapp_reply(phone_number_id, from_number, result)
     except Exception as e:
-        logger.error(f"Error procesando mensaje de WhatsApp: {e}")
+        logger.error(f"Error procesando mensaje: {e}")
         await send_whatsapp_reply(
             phone_number_id, from_number,
-            "Ocurrió un error al procesar tu solicitud. Intentá de nuevo en unos segundos."
+            "Ocurrió un error. Intentá de nuevo en unos segundos."
         )
 
 
 @app.post("/webhook/kapso")
-async def kapso_webhook(
-    request: Request,
-    background_tasks: BackgroundTasks,
-    x_kapso_signature: Optional[str] = Header(None),
-):
+async def kapso_webhook(request: Request, background_tasks: BackgroundTasks):
     """
     Webhook que recibe mensajes de WhatsApp desde Kapso.
+
+    Payload real de Kapso (sin envelope de evento):
+    {
+      "message": { "from": "...", "text": { "body": "..." }, "type": "text", ... },
+      "conversation": { "phone_number_id": "...", ... },
+      "phone_number_id": "..."
+    }
 
     Configurá en Kapso:
       URL:    https://tu-app.herokuapp.com/webhook/kapso
       Evento: whatsapp.message.received
-      Secret: el valor de KAPSO_WEBHOOK_SECRET (opcional pero recomendado)
     """
-    raw_body = await request.body()
-
-    # Verificar firma si está configurada
-    if not verify_kapso_signature(raw_body, x_kapso_signature or ""):
-        raise HTTPException(status_code=401, detail="Firma inválida")
-
     try:
         payload: Dict[str, Any] = await request.json()
     except Exception:
         raise HTTPException(status_code=400, detail="Payload JSON inválido")
 
-    logger.info(f"Webhook recibido de Kapso: {payload.get('event', 'unknown')}")
+    logger.info(f"Webhook recibido: {str(payload)[:300]}")
 
-    # Solo procesamos mensajes entrantes de texto
-    event = payload.get("event", "")
-    if event != "whatsapp.message.received":
-        return JSONResponse({"status": "ignored", "event": event})
-
-    data = payload.get("data", {})
-    message = data.get("message", {})
+    # Extraer campos del payload real de Kapso
+    message = payload.get("message", {})
     msg_type = message.get("type", "")
 
-    # Solo texto por ahora (podés extender a audio, imagen, etc.)
     if msg_type != "text":
-        logger.info(f"Tipo de mensaje no soportado: {msg_type}")
+        logger.info(f"Tipo no soportado: {msg_type}")
         return JSONResponse({"status": "ignored", "reason": f"type={msg_type}"})
 
-    text = message.get("text", {}).get("body", "").strip()
-    from_number = data.get("contact", {}).get("phone", "") or message.get("from", "")
-    phone_number_id = data.get("phone_number_id", "") or payload.get("phone_number_id", "")
+    text = (message.get("text") or {}).get("body", "").strip()
+    from_number = message.get("from", "")
 
-    if not text or not from_number:
-        return JSONResponse({"status": "ignored", "reason": "empty message or missing from"})
-
-    # Responder 200 inmediatamente y procesar en background
-    # (Kapso espera respuesta rápida para no reintentar)
-    background_tasks.add_task(
-        process_whatsapp_message, phone_number_id, from_number, text
+    # phone_number_id viene en la raíz o dentro de conversation
+    phone_number_id = (
+        payload.get("phone_number_id")
+        or (payload.get("conversation") or {}).get("phone_number_id", "")
     )
 
+    if not text or not from_number or not phone_number_id:
+        logger.warning(f"Campos faltantes — from={from_number}, phone_id={phone_number_id}, text={bool(text)}")
+        return JSONResponse({"status": "ignored", "reason": "missing fields"})
+
+    # Responder 200 inmediatamente y procesar en background
+    background_tasks.add_task(process_whatsapp_message, phone_number_id, from_number, text)
     return JSONResponse({"status": "accepted"})
 
 

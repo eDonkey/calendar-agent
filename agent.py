@@ -1,67 +1,155 @@
 """
-agent.py
-Agente CrewAI para gestionar Google Calendar.
+agent.py — Agente de Google Calendar sin CrewAI.
+Usa la API de Anthropic directamente con tool_use para reducir uso de memoria
+de ~600MB (CrewAI) a ~50MB.
 """
 import os
-import asyncio
 import logging
 
-from crewai import Agent, Task, Crew, Process
-from google_calendar_tool import get_all_tools
+import anthropic
+from google_calendar_tool import (
+    ListEventsTool, CreateEventTool, UpdateEventTool,
+    DeleteEventTool, GetEventTool
+)
 
 logger = logging.getLogger(__name__)
 
+TOOLS = [
+    {
+        "name": "list_calendar_events",
+        "description": "Lista eventos del Google Calendar. Filtrá por rango de fechas o texto libre.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "time_min": {"type": "string", "description": "Fecha inicio ISO8601 con timezone, ej: 2026-04-24T00:00:00-03:00"},
+                "time_max": {"type": "string", "description": "Fecha fin ISO8601 con timezone"},
+                "max_results": {"type": "integer", "description": "Máximo de eventos (default 10)"},
+                "query": {"type": "string", "description": "Texto libre para filtrar"}
+            }
+        }
+    },
+    {
+        "name": "create_calendar_event",
+        "description": "Crea un nuevo evento en Google Calendar.",
+        "input_schema": {
+            "type": "object",
+            "required": ["summary", "start", "end"],
+            "properties": {
+                "summary": {"type": "string"},
+                "start": {"type": "string", "description": "ISO8601 con timezone -03:00"},
+                "end": {"type": "string", "description": "ISO8601 con timezone -03:00"},
+                "description": {"type": "string"},
+                "location": {"type": "string"},
+                "attendees": {"type": "array", "items": {"type": "string"}}
+            }
+        }
+    },
+    {
+        "name": "update_calendar_event",
+        "description": "Modifica un evento existente por su event_id.",
+        "input_schema": {
+            "type": "object",
+            "required": ["event_id"],
+            "properties": {
+                "event_id": {"type": "string"},
+                "summary": {"type": "string"},
+                "start": {"type": "string"},
+                "end": {"type": "string"},
+                "description": {"type": "string"},
+                "location": {"type": "string"}
+            }
+        }
+    },
+    {
+        "name": "delete_calendar_event",
+        "description": "Elimina un evento por su event_id.",
+        "input_schema": {
+            "type": "object",
+            "required": ["event_id"],
+            "properties": {
+                "event_id": {"type": "string"}
+            }
+        }
+    },
+    {
+        "name": "get_calendar_event",
+        "description": "Obtiene detalles de un evento por su ID.",
+        "input_schema": {
+            "type": "object",
+            "required": ["event_id"],
+            "properties": {
+                "event_id": {"type": "string"}
+            }
+        }
+    }
+]
+
+
+def execute_tool(name: str, inputs: dict) -> str:
+    tools_map = {
+        "list_calendar_events":  ListEventsTool(),
+        "create_calendar_event": CreateEventTool(),
+        "update_calendar_event": UpdateEventTool(),
+        "delete_calendar_event": DeleteEventTool(),
+        "get_calendar_event":    GetEventTool(),
+    }
+    tool = tools_map.get(name)
+    if not tool:
+        return f"Herramienta desconocida: {name}"
+    try:
+        return tool._run(**inputs)
+    except Exception as e:
+        logger.error(f"Error en herramienta {name}: {e}")
+        return f"Error ejecutando {name}: {str(e)}"
+
+
+SYSTEM_PROMPT = """Sos un asistente personal de Google Calendar.
+Tenés herramientas para crear, leer, editar y eliminar eventos.
+
+Reglas:
+- Respondé en español rioplatense, amigable y conciso.
+- El timezone es America/Argentina/Buenos_Aires (UTC-3). Usá siempre offset -03:00.
+- Cuando listés eventos, organizalos cronológicamente.
+- Antes de eliminar, confirmá el ID con list_calendar_events.
+- Si no especifican hora de fin, asumí 1 hora después del inicio.
+- Máximo 3-4 párrafos por respuesta.
+"""
+
 
 async def run_calendar_agent(user_message: str) -> str:
-    """Ejecuta el agente con el mensaje del usuario y retorna la respuesta."""
+    """Agente con tool_use directo. ~50MB de RAM vs ~600MB de CrewAI."""
+    client = anthropic.AsyncAnthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+    messages = [{"role": "user", "content": user_message}]
 
-    # Verificar configuración mínima
-    missing = [v for v in ["GOOGLE_CLIENT_ID", "GOOGLE_CLIENT_SECRET", "GOOGLE_REFRESH_TOKEN", "ANTHROPIC_API_KEY"] if not os.getenv(v)]
-    if missing:
-        return (
-            f"⚠️ Faltan variables de entorno: {', '.join(missing)}\n\n"
-            "Seguí el README para obtener tus credenciales de Google y configurarlas en Heroku."
+    for _ in range(5):
+        response = await client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=1024,
+            system=SYSTEM_PROMPT,
+            tools=TOOLS,
+            messages=messages,
         )
 
-    tools = get_all_tools()
+        logger.info(f"Stop reason: {response.stop_reason}")
 
-    agent = Agent(
-        role="Asistente personal de Google Calendar",
-        goal=(
-            "Gestionar el Google Calendar del usuario: crear, leer, editar y eliminar eventos. "
-            "Siempre confirmás las acciones con detalles claros y organizás los eventos cronológicamente."
-        ),
-        backstory=(
-            "Sos un asistente personal altamente organizado, experto en gestión de agendas. "
-            "Tenés acceso directo a Google Calendar. "
-            "Respondés siempre en español rioplatense, de forma amigable y precisa. "
-            "Cuando listás eventos los organizás por fecha. "
-            "Cuando el usuario pide eliminar algo, primero buscás el evento para confirmar el ID correcto. "
-            "El timezone de Argentina es UTC-3 (America/Argentina/Buenos_Aires)."
-        ),
-        tools=tools,
-        llm="anthropic/claude-sonnet-4-20250514",
-        verbose=True,
-        memory=False,
-        max_iter=8,
-    )
+        if response.stop_reason == "end_turn":
+            return "\n".join(b.text for b in response.content if hasattr(b, "text")).strip()
 
-    task = Task(
-        description=(
-            f"El usuario solicita lo siguiente:\n\n{user_message}\n\n"
-            "Usá las herramientas disponibles para realizar la acción. "
-            "Respondé en español rioplatense con los detalles del resultado. "
-            "Si es un listado, organizalo cronológicamente. "
-            "Si creaste/editaste/eliminaste algo, confirmá todos los detalles."
-        ),
-        agent=agent,
-        expected_output=(
-            "Respuesta en español sobre la acción realizada, con títulos, fechas y horas donde corresponda."
-        ),
-    )
+        if response.stop_reason == "tool_use":
+            messages.append({"role": "assistant", "content": response.content})
+            tool_results = []
+            for block in response.content:
+                if block.type == "tool_use":
+                    logger.info(f"Tool: {block.name} | Input: {block.input}")
+                    result = execute_tool(block.name, block.input)
+                    tool_results.append({
+                        "type": "tool_result",
+                        "tool_use_id": block.id,
+                        "content": result,
+                    })
+            messages.append({"role": "user", "content": tool_results})
+            continue
 
-    crew = Crew(agents=[agent], tasks=[task], process=Process.sequential, verbose=True)
+        break
 
-    loop = asyncio.get_event_loop()
-    result = await loop.run_in_executor(None, crew.kickoff)
-    return str(result)
+    return "\n".join(b.text for b in response.content if hasattr(b, "text")).strip() or "No pude completar la acción."
