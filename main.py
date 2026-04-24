@@ -88,11 +88,13 @@ async def send_whatsapp_reply(phone_number_id: str, to: str, text: str):
     """Envía una respuesta de texto por WhatsApp vía Kapso API."""
     kapso_key = os.getenv("KAPSO_API_KEY")
     if not kapso_key:
-        logger.error("KAPSO_API_KEY no configurada, no se puede responder por WhatsApp.")
+        logger.error("KAPSO_API_KEY no configurada.")
         return
 
-    url = f"https://api.kapso.ai/platform/v1/whatsapp/phone_numbers/{phone_number_id}/messages"
+    url = f"https://api.kapso.ai/meta/whatsapp/v24.0/{phone_number_id}/messages"
     payload = {
+        "messaging_product": "whatsapp",
+        "recipient_type": "individual",
         "to": to,
         "type": "text",
         "text": {"body": text[:4000]},
